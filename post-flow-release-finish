@@ -1,0 +1,66 @@
+#!/bin/sh
+#
+# Runs at the end of git flow release finish
+#
+# Positional arguments:
+# $1    The version (including the version prefix)
+# $2    The origin remote
+# $3    The full branch name (including the release prefix)
+#
+# The following variables are available as they are exported by git-flow:
+#
+# MASTER_BRANCH - The branch defined as Master
+# DEVELOP_BRANCH - The branch defined as Develop
+#
+VERSION=$1
+ORIGIN=$2
+BRANCH=$3
+
+# Implement your script here.
+
+PUSH_PROD=$(git config --get gitflow.release.finish.pushproduction)
+#only create pull request if pushing to production
+
+if [[ $PUSH_PROD = true ]]; then
+	VSTS_REPO=$(git remote get-url origin)
+
+	#ignore if not VSTS repo
+	if [[ $VSTS_REPO = *"visualstudio.com"* ]]; then
+
+		#push release to origin (pre-empting the pushproduction operation)
+		git push "$ORIGIN" "$MASTER_BRANCH"
+	 
+		VSTS_API=${VSTS_REPO/_git/_apis/git/repositories}
+		VSTS_CREDS=$(echo "url=$VSTS_REPO" | git credential fill | grep "password="  | sed 's/password=//g') 
+		ENCODED_CREDS=$(printf ":$VSTS_CREDS" | base64)
+		BODY="{ 'sourceRefName': 'refs/heads/$MASTER_BRANCH','targetRefName':'refs/heads/$DEVELOP_BRANCH','title':'Merge $MASTER_BRANCH to $DEVELOP_BRANCH for release $VERSION'}"
+		HTTP_RESPONSE=$(curl --silent --write-out "HTTPSTATUS:%{http_code}" -H "Authorization: Basic $ENCODED_CREDS" -H "Content-Type: application/json" -X POST -d "$BODY" "$VSTS_API/pullRequests?api-version=3.0")
+		HTTP_STATUS=$(echo $HTTP_RESPONSE | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+
+		if [ ! $HTTP_STATUS -eq 201  ]; then
+		  echo "Unable to create pull request, please create manually"
+		  echo "$HTTP_RESPONSE"
+		else
+			PR_REGEX='\"self\":{\"href\":\"([^\"]+)'
+			USER_REGEX='_apis/Identities/([^\"]+)'
+			if [[ "$HTTP_RESPONSE" =~ $PR_REGEX ]]
+			 then 			
+				PULL_REQUESTURL=${BASH_REMATCH[1]} 
+				echo "Pull request created $PULL_REQUESTURL"
+				if [[ "$HTTP_RESPONSE" =~ $USER_REGEX ]]
+				 then 
+				 	USER_ID=${BASH_REMATCH[1]}
+					BODY="{'autoCompleteSetBy': {'id': '$USER_ID'  },'completionOptions': {'deleteSourceBranch': 'false','squashMerge':'false'}}"
+					HTTP_RESPONSE=$(curl --silent --write-out "HTTPSTATUS:%{http_code}" -H "Authorization: Basic $ENCODED_CREDS" -H "Content-Type: application/json" -X PATCH -d "$BODY" "$PULL_REQUESTURL?api-version=3.0")
+					HTTP_STATUS=$(echo $HTTP_RESPONSE | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+					if [ ! $HTTP_STATUS -eq 200  ]; then
+					  echo "Unable to set complete status on pull request"
+					  echo "$HTTP_RESPONSE"
+					fi
+				fi
+			fi 		
+		fi
+	fi	
+else
+	echo "To enable automatic pull request creation set the push production flag (git config --global gitflow.release.finish.pushproduction true)"
+fi
