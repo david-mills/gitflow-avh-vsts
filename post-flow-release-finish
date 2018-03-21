@@ -40,7 +40,7 @@ abandon_pull_request() {
 	local response=$(call_vsts "$1" "PATCH" "$body")	
 	local status=$(get_status "$response")
 	if [ ! $status -eq 200  ]; then
-		die "Unable to set abandon status on pull request $1 Please abandon manually and recreate pull request - Response: $response"
+		die "Unable to set abandon status on pull request $1 Please abandon manually and recretae pull request - Response: $response"
 	fi
 }
 get_user_from_response(){
@@ -48,7 +48,7 @@ get_user_from_response(){
 	if [[ "$1" =~ $user_regex ]]; then 		
 		echo "${BASH_REMATCH[1]}"
 	else
-		die "Unable to find pull request user id in response $1.  Please complete pull request manually"
+		die "Unable to find pull request user in response $1.  Plegit pullse complete pull request manually"
 	fi
 }
 get_pull_request() {
@@ -76,7 +76,6 @@ complete_pull_request() {
 		die "Unable to set complete status on pull request $1 - Response: $response"
 	fi
 }
-
 get_web_pull_request(){
 	local url="$1"
 	local pullrequestid=${url##*/}
@@ -104,43 +103,65 @@ if [ "$PUSH_PROD" = "true" ] && [ "$DEVELOP_MERGE" != "true" ]; then
 	VSTS_REPO=$(git remote get-url origin)
 	#ignore if not VSTS repo
 	if [[ $VSTS_REPO = *"visualstudio.com"* ]]; then
-		#push release to origin (pre-empting the pushproduction operation)
+		#push release to origin (needed for the pull request pre-empting the pushproduction operation)
 		git push "$ORIGIN" "$MASTER_BRANCH"	 
 		VSTS_API=${VSTS_REPO/_git/_apis/git/repositories}
+		#create pull request
 		response=$(create_pull_request "$MASTER_BRANCH" "$DEVELOP_BRANCH" "Merge $MASTER_BRANCH to $DEVELOP_BRANCH for release $VERSION")
 		pullrequesturl=$(get_pull_request "$response")
+		#check if pull request has conflicts
 		if is_pull_request_conflicted "$pullrequesturl"; then
 			abandon_pull_request "$pullrequesturl"
+			#abandon pull request, create a new brach from develop (which will have merge conflicts resolved)
 			git checkout -b "$MERGE_BRANCH" "$DEVELOP_BRANCH"
 			git push -u "$ORIGIN" "$MERGE_BRANCH"
+			#create new pull request from the merged branch rather than the master branch
+			#this will have all the commits from master
 			response=$(create_pull_request "$MERGE_BRANCH" "$DEVELOP_BRANCH" "Merge $MERGE_BRANCH to $DEVELOP_BRANCH for release $VERSION")
 			pullrequesturl=$(get_pull_request "$response")
 			if is_pull_request_conflicted "$pullrequesturl"; then
+				#if still conflicts, something has changed in develop since this operation was started
 				die "Conflicts detected from branch $MERGE_BRANCH, merge develop into branch $MERGE_BRANCH, push, and then create a pull request manually"
 			fi
 			DELETE_SOURCE=true
 		fi
 		user_id=$(get_user_from_response "$response")
+		#set auto complete status, delete the source branch if its a merge branch
 		complete_pull_request "$pullrequesturl" "$user_id" "$DELETE_SOURCE"
 		git checkout "$DEVELOP_BRANCH"
+		#reset develop branch to origin, removing the merge done by git flow (this is pushed to develop by a pull request)
 		git reset --hard "$ORIGIN/$DEVELOP_BRANCH"
+		#delete local merge branch
 		if git_local_branch_exists "$MERGE_BRANCH"; then
 			git branch -D "$MERGE_BRANCH"				  	
 		fi
 		echo
 		echo "Summary of pull request:"
 		web_pull_request_url=$(get_web_pull_request $pullrequesturl)
+
+		FORCE_DELETE=$(git config --get gitflow.release.finish.force-delete)
 		if $DELETE_SOURCE; then
-			echo "- Conflicts detected, branch $MERGE_BRANCH created from $DEVELOP_BRANCH"
+			echo "- Conflicts detected, branch '$MERGE_BRANCH' created from '$DEVELOP_BRANCH'"
 			echo "- Pull Request created at $web_pull_request_url"
-			echo "- Pull Request set to autocomplete and branch $MERGE_BRANCH will be deleted on completion"
-			echo "- Branch $MERGE_BRANCH has been deleted locally"
+			echo "- Pull Request set to autocomplete and branch '$MERGE_BRANCH' will be deleted on completion"
+			echo "- Branch '$MERGE_BRANCH' has been deleted locally"			
+			echo "- '$DEVELOP_BRANCH' branch has been reset to '$ORIGIN' after merge"
+			if [ "$FORCE_DELETE" != "true" ]; then
+				#this is needed as the commits in release are not in develop since we have reset the develop branch
+				#they will be in origin when the pull request completes, so safe to force delete this branch
+				echo
+				echo "Follow up actions:"
+				echo "- Delete '$BRANCH' locally using 'git branch -D $BRANCH'"
+				echo "  to stop this happening on conflict branches run 'git config --global gitflow.release.finish.force-delete true'"
+			fi
 		else
 			echo "- Pull Request created at $web_pull_request_url"
 			echo "- Pull Request set to autocomplete"
-		fi
-		echo "- $DEVELOP_BRANCH branch has been reset to $ORIGIN after merge"		
+			echo "- '$DEVELOP_BRANCH' branch has been reset to '$ORIGIN' after merge"
+		fi		
 		echo
+		#open pull request in browser
+		#need to improve this
 		"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" "$web_pull_request_url"
 	fi	
 else
