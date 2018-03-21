@@ -17,50 +17,137 @@ ORIGIN=$2
 BRANCH=$3
 
 # Implement your script here.
+#
+# Function used by finish command to actually finish the release branch
+# Called when the base of the release is the $DEVELOP_BRANCH
+#
+warn() { echo "$@" >&2; }
+die() { warn "Fatal: $@"; exit 1; }
+git_local_branch_exists() {
+	[ -n "$1" ] || die "Missing branch name"
+	[ -n "$(git for-each-ref --format='%(refname:short)' refs/heads/$1)" ]
+}
+get_status() {
+	local status=$(echo $1 | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+	echo "$status"
+}
+is_pull_request_conflicted() {
+	local response=$(call_vsts "$1" "GET")
+	[[ $response = *"conflicts"*  ]]
+}
+abandon_pull_request() {
+	local body="{'status':'abandoned'}}"
+	local response=$(call_vsts "$1" "PATCH" "$body")	
+	local status=$(get_status "$response")
+	if [ ! $status -eq 200  ]; then
+		die "Unable to set abandon status on pull request $1 Please abandon manually and recreate pull request - Response: $response"
+	fi
+}
+get_user_from_response(){
+	local user_regex='_apis/Identities/([^\"]+)'
+	if [[ "$1" =~ $user_regex ]]; then 		
+		echo "${BASH_REMATCH[1]}"
+	else
+		die "Unable to find pull request user id in response $1.  Please complete pull request manually"
+	fi
+}
+get_pull_request() {
+	local pr_regex='\"self\":{\"href\":\"([^\"]+)'
+	if [[ "$1" =~ $pr_regex ]];	then 			
+		echo "${BASH_REMATCH[1]}"
+	else
+		die "Unable to find pull request in response $1.  Please complete pull request manually"
+	fi
+}
+create_pull_request() {
+	local body="{ 'sourceRefName': 'refs/heads/$1','targetRefName':'refs/heads/$2','title':'$3'}"
+	local response=$(call_vsts "$VSTS_API/pullRequests" "POST" "$body")
+	local status=$(get_status "$response")
+	if [ ! $status -eq 201  ]; then
+		die "Unable to create pull request from $1 to $2, please create manually - Response: $response"
+	fi
+	echo "$response"
+}
+complete_pull_request() {
+	local body="{'autoCompleteSetBy': {'id': '$2'  },'completionOptions': {'deleteSourceBranch': '$3','squashMerge':'false'}}"
+	local response=$(call_vsts "$1" "PATCH" "$body")
+	local status=$(get_status "$response")
+	if [ ! $status -eq 200  ]; then
+		die "Unable to set complete status on pull request $1 - Response: $response"
+	fi
+}
 
+get_web_pull_request(){
+	local url="$1"
+	local pullrequestid=${url##*/}
+	echo "$VSTS_REPO/pullrequest/$pullrequestid"
+}
+call_vsts() {
+		local repo="$VSTS_REPO"
+		local creds=$(echo "url=$repo" | git credential fill | grep "password="  | sed 's/password=//g') 
+		local encoded_creds=$(printf ":$creds" | base64)
+		local body=$3
+		local response
+		if [[ -z $body ]]; then
+			response=$(curl --silent --write-out "HTTPSTATUS:%{http_code}" -H "Authorization: Basic $encoded_creds" -H "Content-Type: application/json" -X $2 "$1?api-version=3.0")			
+		else
+			response=$(curl --silent --write-out "HTTPSTATUS:%{http_code}" -H "Authorization: Basic $encoded_creds" -H "Content-Type: application/json" -X $2 -d "$body" "$1?api-version=3.0")
+		fi
+		echo "$response"
+}
+
+MERGE_BRANCH="merge/$VERSION"
+DELETE_SOURCE=false
 PUSH_PROD=$(git config --get gitflow.release.finish.pushproduction)
-#only create pull request if pushing to production
-
-if [[ $PUSH_PROD = true ]]; then
+DEVELOP_MERGE=$(git config --get gitflow.release.finish.nodevelopmerge)
+if [ "$PUSH_PROD" = "true" ] && [ "$DEVELOP_MERGE" != "true" ]; then
 	VSTS_REPO=$(git remote get-url origin)
-
 	#ignore if not VSTS repo
 	if [[ $VSTS_REPO = *"visualstudio.com"* ]]; then
-
 		#push release to origin (pre-empting the pushproduction operation)
-		git push "$ORIGIN" "$MASTER_BRANCH"
-	 
+		git push "$ORIGIN" "$MASTER_BRANCH"	 
 		VSTS_API=${VSTS_REPO/_git/_apis/git/repositories}
-		VSTS_CREDS=$(echo "url=$VSTS_REPO" | git credential fill | grep "password="  | sed 's/password=//g') 
-		ENCODED_CREDS=$(printf ":$VSTS_CREDS" | base64)
-		BODY="{ 'sourceRefName': 'refs/heads/$MASTER_BRANCH','targetRefName':'refs/heads/$DEVELOP_BRANCH','title':'Merge $MASTER_BRANCH to $DEVELOP_BRANCH for release $VERSION'}"
-		HTTP_RESPONSE=$(curl --silent --write-out "HTTPSTATUS:%{http_code}" -H "Authorization: Basic $ENCODED_CREDS" -H "Content-Type: application/json" -X POST -d "$BODY" "$VSTS_API/pullRequests?api-version=3.0")
-		HTTP_STATUS=$(echo $HTTP_RESPONSE | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
-
-		if [ ! $HTTP_STATUS -eq 201  ]; then
-		  echo "Unable to create pull request, please create manually"
-		  echo "$HTTP_RESPONSE"
-		else
-			PR_REGEX='\"self\":{\"href\":\"([^\"]+)'
-			USER_REGEX='_apis/Identities/([^\"]+)'
-			if [[ "$HTTP_RESPONSE" =~ $PR_REGEX ]]
-			 then 			
-				PULL_REQUESTURL=${BASH_REMATCH[1]} 
-				echo "Pull request created $PULL_REQUESTURL"
-				if [[ "$HTTP_RESPONSE" =~ $USER_REGEX ]]
-				 then 
-				 	USER_ID=${BASH_REMATCH[1]}
-					BODY="{'autoCompleteSetBy': {'id': '$USER_ID'  },'completionOptions': {'deleteSourceBranch': 'false','squashMerge':'false'}}"
-					HTTP_RESPONSE=$(curl --silent --write-out "HTTPSTATUS:%{http_code}" -H "Authorization: Basic $ENCODED_CREDS" -H "Content-Type: application/json" -X PATCH -d "$BODY" "$PULL_REQUESTURL?api-version=3.0")
-					HTTP_STATUS=$(echo $HTTP_RESPONSE | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
-					if [ ! $HTTP_STATUS -eq 200  ]; then
-					  echo "Unable to set complete status on pull request"
-					  echo "$HTTP_RESPONSE"
-					fi
-				fi
-			fi 		
+		response=$(create_pull_request "$MASTER_BRANCH" "$DEVELOP_BRANCH" "Merge $MASTER_BRANCH to $DEVELOP_BRANCH for release $VERSION")
+		pullrequesturl=$(get_pull_request "$response")
+		if is_pull_request_conflicted "$pullrequesturl"; then
+			abandon_pull_request "$pullrequesturl"
+			git checkout -b "$MERGE_BRANCH" "$DEVELOP_BRANCH"
+			git push -u "$ORIGIN" "$MERGE_BRANCH"
+			response=$(create_pull_request "$MERGE_BRANCH" "$DEVELOP_BRANCH" "Merge $MERGE_BRANCH to $DEVELOP_BRANCH for release $VERSION")
+			pullrequesturl=$(get_pull_request "$response")
+			if is_pull_request_conflicted "$pullrequesturl"; then
+				die "Conflicts detected from branch $MERGE_BRANCH, merge develop into branch $MERGE_BRANCH, push, and then create a pull request manually"
+			fi
+			DELETE_SOURCE=true
 		fi
+		user_id=$(get_user_from_response "$response")
+		complete_pull_request "$pullrequesturl" "$user_id" "$DELETE_SOURCE"
+		git checkout "$DEVELOP_BRANCH"
+		git reset --hard "$ORIGIN/$DEVELOP_BRANCH"
+		if git_local_branch_exists "$MERGE_BRANCH"; then
+			git branch -D "$MERGE_BRANCH"				  	
+		fi
+		echo
+		echo "Summary of pull request:"
+		web_pull_request_url=$(get_web_pull_request $pullrequesturl)
+		if $DELETE_SOURCE; then
+			echo "- Conflicts detected, branch $MERGE_BRANCH created from $DEVELOP_BRANCH"
+			echo "- Pull Request created at $web_pull_request_url"
+			echo "- Pull Request set to autocomplete and branch $MERGE_BRANCH will be deleted on completion"
+			echo "- Branch $MERGE_BRANCH has been deleted locally"
+		else
+			echo "- Pull Request created at $web_pull_request_url"
+			echo "- Pull Request set to autocomplete"
+		fi
+		echo "- $DEVELOP_BRANCH branch has been reset to $ORIGIN after merge"		
+		echo
+		"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" "$web_pull_request_url"
 	fi	
 else
-	echo "To enable automatic pull request creation set the push production flag (git config --global gitflow.release.finish.pushproduction true)"
+	echo
+	echo "To enable automatic pull request creation set the push production flag:"
+	echo "		git config --global gitflow.release.finish.pushproduction true"
+	echo "and enable pushing to the develop branch:"
+	echo "		git config --global gitflow.release.finish.nodevelopmerge false"
+	echo
 fi
