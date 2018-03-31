@@ -163,6 +163,12 @@ if [ "$PUSH_PROD" = "true" ] && [ "$DEVELOP_MERGE" != "true" ]; then
 		#open pull request in browser
 		#need to improve this
 		"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" "$web_pull_request_url"
+
+		if which open > /dev/null; then
+		  open "$web_pull_request_url"
+		elif which start > /dev/null; then
+		  start "$web_pull_request_url"
+		fi
 	fi	
 else
 	echo
